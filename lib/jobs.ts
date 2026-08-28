@@ -76,45 +76,58 @@ export type TriageSuggestion = {
   reason: string;
 };
 
-const FILE_AS = new Set<string>(["Task", "Note", "Decision", "dump"]);
+const FILE_AS_MAP: Record<string, FileAs> = {
+  task: "Task",
+  note: "Note",
+  decision: "Decision",
+  dump: "dump",
+};
 
+function extractJsonArray(output: string): unknown[] | null {
+  const fenced = output.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const blobs = fenced ? [fenced[1], output] : [output];
+  for (const blob of blobs) {
+    const start = blob.indexOf("[");
+    if (start < 0) continue;
+    for (let end = blob.lastIndexOf("]"); end > start; end = blob.lastIndexOf("]", end - 1)) {
+      try {
+        const parsed = JSON.parse(blob.slice(start, end + 1)) as unknown;
+        if (Array.isArray(parsed)) return parsed;
+      } catch {
+        continue;
+      }
+    }
+  }
+  return null;
+}
+
+function normalizePageId(id: string): string {
+  return id.replace(/-/g, "").toLowerCase();
+}
+
+/** Parsed suggestions only. Missing/unparseable notes are handled by triageFallbackComment. */
 export function parseTriageSuggestions(
   output: string,
   notes: Array<{ id: string }>,
 ): TriageSuggestion[] {
-  const byId = new Map<string, { fileAs: FileAs; reason: string }>();
-  const jsonMatch = output.match(/\[[\s\S]*\]/);
-  if (jsonMatch) {
-    try {
-      const parsed = JSON.parse(jsonMatch[0]) as unknown;
-      if (Array.isArray(parsed)) {
-        for (const item of parsed) {
-          if (!item || typeof item !== "object") continue;
-          const rec = item as Record<string, unknown>;
-          const id = String(rec.id ?? "");
-          const fileAs = String(rec.fileAs ?? rec.file_as ?? "");
-          const reason = String(rec.reason ?? "").trim();
-          if (id && FILE_AS.has(fileAs)) {
-            byId.set(id, {
-              fileAs: fileAs as FileAs,
-              reason: reason || "No reason given",
-            });
-          }
-        }
-      }
-    } catch {
-      // fall through to per-note fallback
-    }
+  const known = new Map(notes.map((n) => [normalizePageId(n.id), n.id]));
+  const parsed = extractJsonArray(output);
+  if (!parsed) return [];
+  const out: TriageSuggestion[] = [];
+  const seen = new Set<string>();
+  for (const item of parsed) {
+    if (!item || typeof item !== "object") continue;
+    const rec = item as Record<string, unknown>;
+    const rawId = String(rec.id ?? rec.pageId ?? rec.page_id ?? "").trim();
+    const canonical = known.get(normalizePageId(rawId));
+    if (!canonical || seen.has(canonical)) continue;
+    const fileAs = FILE_AS_MAP[String(rec.fileAs ?? rec.file_as ?? "").trim().toLowerCase()];
+    if (!fileAs) continue;
+    const reason = String(rec.reason ?? "").trim() || "No reason given";
+    seen.add(canonical);
+    out.push({ id: canonical, fileAs, reason: reason.slice(0, 500) });
   }
-  return notes.map((note) => {
-    const found = byId.get(note.id);
-    if (found) return { id: note.id, ...found };
-    return {
-      id: note.id,
-      fileAs: "Note",
-      reason: "Unparsed triage output. Waiting on PM to file. Status not changed.",
-    };
-  });
+  return out;
 }
 
 export function triageCommentText(suggestion: TriageSuggestion): string {
@@ -124,6 +137,16 @@ export function triageCommentText(suggestion: TriageSuggestion): string {
     `Reason: ${suggestion.reason}`,
     "Note Status was not changed.",
   ].join("\n");
+}
+
+export function triageFallbackComment(output: string): string {
+  const snippet = output.replace(/\s+/g, " ").trim().slice(0, 400);
+  return [
+    "Triage: waiting on PM to file; Status not changed.",
+    snippet ? `Model output snippet: ${snippet}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 export type HealthFlag = "overdue" | "blocked" | "no owner" | "P0 not in progress";
@@ -142,10 +165,10 @@ export function healthSuggestionForFlags(flags: HealthFlag[]): {
 export function healthSuggestionComment(flags: HealthFlag[]): string {
   const { health, reasons } = healthSuggestionForFlags(flags);
   return [
-    "AI Health suggestion (not applied — waiting on PM).",
+    "AI Health suggestion (not applied).",
     `Suggested Health: ${health}.`,
     `Reasons: ${reasons.join("; ")}.`,
-    "Health and Status were not changed. No Blockers row was created.",
+    "PM must confirm; Health not set. Status was not changed. No Blockers row was created.",
   ].join("\n");
 }
 
@@ -172,10 +195,14 @@ export async function runTriageJob(triggeredBy: string): Promise<ExecuteRunResul
     ].join("\n"),
   });
 
-  if (result.ok && result.output) {
-    const suggestions = parseTriageSuggestions(result.output, notes);
-    for (const suggestion of suggestions) {
-      await createPageComment(suggestion.id, triageCommentText(suggestion));
+  if (result.ok) {
+    const output = result.output ?? "";
+    const suggestions = parseTriageSuggestions(output, notes);
+    const byId = new Map(suggestions.map((s) => [s.id, s]));
+    for (const note of notes) {
+      const suggestion = byId.get(note.id);
+      const text = suggestion ? triageCommentText(suggestion) : triageFallbackComment(output);
+      await createPageComment(note.id, text);
     }
   }
   return result;

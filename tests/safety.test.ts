@@ -61,18 +61,16 @@ describe("createPageComment", () => {
     delete process.env.OPENROUTER_API_KEY;
   });
 
-  it("redacts secrets and never patches Status or Health", async () => {
+  it("redacts secrets and never includes the API key", async () => {
     process.env.OPENROUTER_API_KEY = "sk-test-secret-key";
     const create = vi.fn().mockResolvedValue({});
-    const update = vi.fn();
     setNotionClientForTests({
       comments: { create },
-      pages: { update, create: vi.fn(), retrieve: vi.fn() },
+      pages: { update: vi.fn(), create: vi.fn(), retrieve: vi.fn() },
     } as never);
 
     await createPageComment("note-1", "file as Task using sk-test-secret-key");
 
-    expect(update).not.toHaveBeenCalled();
     expect(create).toHaveBeenCalledTimes(1);
     const arg = create.mock.calls[0][0] as {
       parent: { page_id: string };
@@ -82,7 +80,21 @@ describe("createPageComment", () => {
     const content = arg.rich_text.map((t) => t.text.content).join("");
     expect(content).not.toContain("sk-test-secret-key");
     expect(content).toContain("[REDACTED]");
-    expect(content).not.toMatch(/"Status"/);
-    expect(content).not.toMatch(/"Health"/);
+  });
+
+  it("does not call pages.update with Status or Health", async () => {
+    const create = vi.fn().mockResolvedValue({});
+    const update = vi.fn();
+    setNotionClientForTests({
+      comments: { create },
+      pages: { update, create: vi.fn(), retrieve: vi.fn() },
+    } as never);
+
+    await createPageComment("task-1", "Suggested Health: Red. Status stays Inbox.");
+
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(update).not.toHaveBeenCalled();
+    const payload = JSON.stringify(create.mock.calls[0][0]);
+    expect(payload).not.toMatch(/"properties"/);
   });
 });
