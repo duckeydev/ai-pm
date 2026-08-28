@@ -1,0 +1,17 @@
+:root {
+  color-scheme: light dark;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  line-height: 1.45;
+}
+body {
+  margin: 1.5rem auto;
+  max-width: 44rem;
+  padding: 0 1rem;
+}
+code, pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+}
+table { border-collapse: collapse; width: 100%; }
+th, td { border-bottom: 1px solid currentColor; padding: 0.4rem 0.5rem; text-align: left; }
+.muted { opacity: 0.75; }
