@@ -30,14 +30,14 @@ Database page IDs (docs only): Tasks `1f8ac0f744d54476aef030cb54d4a24e`, Project
 
 All jobs POST and require `Authorization: Bearer $CRON_SECRET`.
 
-Every run writes an **AI Runs** row: Queued to Running to Done (or Error). Related Task/Project **AI summary** is patched after success only.
+Every run writes an **AI Runs** row: Queued to Running to Done (or Error). Related Task/Project **AI summary** is patched after success only. Triage also comments each Inbox note with a file-as suggestion. Risk scan comments flagged tasks with a Health suggestion. Comments never change Status or Health.
 
 | Job | Kind | What it does |
 | --- | --- | --- |
-| `/api/jobs/triage` | Triage | Inbox notes: file-as Task / Note / Decision / dump. Does not change Note Status |
+| `/api/jobs/triage` | Triage | Inbox notes: file-as Task / Note / Decision / dump. Comments the suggestion on each note. Does not change Note Status |
 | `/api/jobs/breakdown` | Breakdown | Task URL to proposed subtasks with Estimate / Priority / Acceptance. Does not create pages |
 | `/api/jobs/standup` | Standup | Markdown digest of Not started / In progress, blockers, Health Red/Amber, Due this week |
-| `/api/jobs/risk` | Risk scan | Overdue, blocked, no owner, P0 not In progress |
+| `/api/jobs/risk` | Risk scan | Overdue, blocked, no owner, P0 not In progress. Comments Health suggestions; does not set Health |
 | `/api/jobs/rewrite` | Rewrite | Messy notes to status update |
 
 Cron (UTC, Asia/Rangoon = UTC+6:30):

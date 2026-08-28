@@ -370,6 +370,15 @@ export async function patchAiSummary(pageId: string, summary: string): Promise<v
   });
 }
 
+export async function createPageComment(pageId: string, text: string): Promise<void> {
+  const safe = redactSecrets(text);
+  const client = getNotionClient();
+  await client.comments.create({
+    parent: { page_id: pageId },
+    rich_text: richTextChunks(safe),
+  });
+}
+
 export async function queryInboxNotes(): Promise<NotionPage[]> {
   return queryCollection(NOTES_COLLECTION, {
     filter: { property: "Status", select: { equals: "Inbox" } },

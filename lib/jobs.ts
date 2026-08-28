@@ -1,5 +1,6 @@
 import { PROJECTS_COLLECTION, TASKS_COLLECTION } from "@/lib/hq";
 import {
+  createPageComment,
   getDate,
   getPageByUrlOrId,
   getPagePlainText,
@@ -67,28 +68,117 @@ function hasOwner(page: NotionPage): boolean {
   return !propIsEmpty(page, "Owner (role)") || !propIsEmpty(page, "Assignee");
 }
 
+export type FileAs = "Task" | "Note" | "Decision" | "dump";
+
+export type TriageSuggestion = {
+  id: string;
+  fileAs: FileAs;
+  reason: string;
+};
+
+const FILE_AS = new Set<string>(["Task", "Note", "Decision", "dump"]);
+
+export function parseTriageSuggestions(
+  output: string,
+  notes: Array<{ id: string }>,
+): TriageSuggestion[] {
+  const byId = new Map<string, { fileAs: FileAs; reason: string }>();
+  const jsonMatch = output.match(/\[[\s\S]*\]/);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[0]) as unknown;
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (!item || typeof item !== "object") continue;
+          const rec = item as Record<string, unknown>;
+          const id = String(rec.id ?? "");
+          const fileAs = String(rec.fileAs ?? rec.file_as ?? "");
+          const reason = String(rec.reason ?? "").trim();
+          if (id && FILE_AS.has(fileAs)) {
+            byId.set(id, {
+              fileAs: fileAs as FileAs,
+              reason: reason || "No reason given",
+            });
+          }
+        }
+      }
+    } catch {
+      // fall through to per-note fallback
+    }
+  }
+  return notes.map((note) => {
+    const found = byId.get(note.id);
+    if (found) return { id: note.id, ...found };
+    return {
+      id: note.id,
+      fileAs: "Note",
+      reason: "Unparsed triage output. Waiting on PM to file. Status not changed.",
+    };
+  });
+}
+
+export function triageCommentText(suggestion: TriageSuggestion): string {
+  return [
+    "AI triage suggestion (not filed — waiting on PM).",
+    `Suggested file-as: ${suggestion.fileAs}.`,
+    `Reason: ${suggestion.reason}`,
+    "Note Status was not changed.",
+  ].join("\n");
+}
+
+export type HealthFlag = "overdue" | "blocked" | "no owner" | "P0 not in progress";
+
+export function healthSuggestionForFlags(flags: HealthFlag[]): {
+  health: "Red" | "Amber";
+  reasons: HealthFlag[];
+} {
+  const reasons = [...new Set(flags)];
+  const health = reasons.some((f) => f === "overdue" || f === "P0 not in progress")
+    ? "Red"
+    : "Amber";
+  return { health, reasons };
+}
+
+export function healthSuggestionComment(flags: HealthFlag[]): string {
+  const { health, reasons } = healthSuggestionForFlags(flags);
+  return [
+    "AI Health suggestion (not applied — waiting on PM).",
+    `Suggested Health: ${health}.`,
+    `Reasons: ${reasons.join("; ")}.`,
+    "Health and Status were not changed. No Blockers row was created.",
+  ].join("\n");
+}
+
 export async function runTriageJob(triggeredBy: string): Promise<ExecuteRunResult> {
   const date = todayYmdRangoon();
-  return executeRun({
+  const notes = await queryInboxNotes();
+  const items = [];
+  for (const note of notes) {
+    const body = await getPagePlainText(note.id);
+    items.push(summarizeNote(note, body));
+  }
+
+  const result = await executeRun({
     name: `Triage ${date}`,
     kind: "Triage",
     triggeredBy,
-    buildPrompt: async () => {
-      const notes = await queryInboxNotes();
-      const items = [];
-      for (const note of notes) {
-        const body = await getPagePlainText(note.id);
-        items.push(summarizeNote(note, body));
-      }
-      return [
-        `Inbox notes (${items.length}) as of ${date} (Asia/Rangoon).`,
-        "For each note, suggest file-as: Task vs Note vs Decision vs dump.",
-        "Do not change Note Status. Output markdown.",
-        "",
-        JSON.stringify(items, null, 2),
-      ].join("\n");
-    },
+    prompt: [
+      `Inbox notes (${items.length}) as of ${date} (Asia/Rangoon).`,
+      "For each note, suggest file-as: Task vs Note vs Decision vs dump.",
+      "Do not change Note Status.",
+      "Output markdown, then a JSON array of {id, fileAs, reason} for each note.",
+      "",
+      JSON.stringify(items, null, 2),
+    ].join("\n"),
   });
+
+  if (result.ok && result.output) {
+    const suggestions = parseTriageSuggestions(result.output, notes);
+    for (const suggestion of suggestions) {
+      await createPageComment(suggestion.id, triageCommentText(suggestion));
+    }
+  }
+  return result;
 }
 
 export async function runBreakdownJob(
@@ -190,55 +280,78 @@ export async function runStandupJob(triggeredBy: string): Promise<ExecuteRunResu
 export async function runRiskJob(triggeredBy: string): Promise<ExecuteRunResult> {
   const today = todayYmdRangoon();
   const summaryTargets: Array<{ id: string }> = [];
+  const tasks = await queryTasks();
+  const overdue: NotionPage[] = [];
+  const blocked: NotionPage[] = [];
+  const noOwner: NotionPage[] = [];
+  const p0NotInProgress: NotionPage[] = [];
+  const flagsById = new Map<string, HealthFlag[]>();
 
-  return executeRun({
+  function addFlag(task: NotionPage, flag: HealthFlag) {
+    const existing = flagsById.get(task.id) ?? [];
+    existing.push(flag);
+    flagsById.set(task.id, existing);
+  }
+
+  for (const task of tasks) {
+    const status = getSelect(task, "Status");
+    if (status === "Done" || status === "Archived") continue;
+    const due = getDate(task, "Due");
+    const dueYmd = due ? ymdInRangoon(due).slice(0, 10) : null;
+    const priority = getSelect(task, "Priority");
+
+    if (dueYmd && dueYmd < today) {
+      overdue.push(task);
+      addFlag(task, "overdue");
+    }
+    if (hasBlockers(task)) {
+      blocked.push(task);
+      addFlag(task, "blocked");
+    }
+    if (!hasOwner(task)) {
+      noOwner.push(task);
+      addFlag(task, "no owner");
+    }
+    if (priority === "P0" && status !== "In progress") {
+      p0NotInProgress.push(task);
+      addFlag(task, "P0 not in progress");
+    }
+  }
+
+  const flagged = [...overdue, ...blocked, ...noOwner, ...p0NotInProgress];
+  const related = uniqueIds(flagged.flatMap((t) => getRelationIds(t, "Project")));
+  summaryTargets.push(...related.map((id) => ({ id })));
+
+  const projects = await queryProjects();
+  const result = await executeRun({
     name: `Risk scan ${today}`,
     kind: "Risk scan",
     triggeredBy,
     summaryTargets,
-    buildPrompt: async () => {
-      const tasks = await queryTasks();
-      const overdue: NotionPage[] = [];
-      const blocked: NotionPage[] = [];
-      const noOwner: NotionPage[] = [];
-      const p0NotInProgress: NotionPage[] = [];
-
-      for (const task of tasks) {
-        const status = getSelect(task, "Status");
-        if (status === "Done" || status === "Archived") continue;
-        const due = getDate(task, "Due");
-        const dueYmd = due ? ymdInRangoon(due).slice(0, 10) : null;
-        const priority = getSelect(task, "Priority");
-
-        if (dueYmd && dueYmd < today) overdue.push(task);
-        if (hasBlockers(task)) blocked.push(task);
-        if (!hasOwner(task)) noOwner.push(task);
-        if (priority === "P0" && status !== "In progress") p0NotInProgress.push(task);
-      }
-
-      const flagged = [...overdue, ...blocked, ...noOwner, ...p0NotInProgress];
-      const related = uniqueIds(flagged.flatMap((t) => getRelationIds(t, "Project")));
-      summaryTargets.splice(0, summaryTargets.length, ...related.map((id) => ({ id })));
-
-      const projects = await queryProjects();
-      return [
-        `Risk scan for ${today} (Asia/Rangoon).`,
-        "Do not change Status or Health. Markdown sections: Overdue, Blocked, No owner, P0 not in progress.",
-        "",
-        JSON.stringify(
-          {
-            overdue: overdue.map(summarizeTask),
-            blocked: blocked.map(summarizeTask),
-            noOwner: noOwner.map(summarizeTask),
-            p0NotInProgress: p0NotInProgress.map(summarizeTask),
-            projects: projects.map(summarizeProject),
-          },
-          null,
-          2,
-        ),
-      ].join("\n");
-    },
+    prompt: [
+      `Risk scan for ${today} (Asia/Rangoon).`,
+      "Do not change Status or Health. Markdown sections: Overdue, Blocked, No owner, P0 not in progress.",
+      "",
+      JSON.stringify(
+        {
+          overdue: overdue.map(summarizeTask),
+          blocked: blocked.map(summarizeTask),
+          noOwner: noOwner.map(summarizeTask),
+          p0NotInProgress: p0NotInProgress.map(summarizeTask),
+          projects: projects.map(summarizeProject),
+        },
+        null,
+        2,
+      ),
+    ].join("\n"),
   });
+
+  if (result.ok) {
+    for (const [id, flags] of flagsById) {
+      await createPageComment(id, healthSuggestionComment(flags));
+    }
+  }
+  return result;
 }
 
 export async function runRewriteJob(
